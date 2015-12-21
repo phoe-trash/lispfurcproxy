@@ -8,123 +8,144 @@
 
 (in-package #:lispfurcproxy)
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; HELPER FUNCTIONS
+
 (defun value (key alist)
-  "Given an alist and a key, returns a respective value or NIL if it's not found."
   (cdr (assoc key alist)))
-
+(defun config-value (key state)
+  (cdr (assoc key (value :config state))))
 (defun key (value alist)
-  "Given an alist and a value, returns a respective key or NIL if it's not found."
   (car (rassoc value alist)))
+(defun get-unix-time ()
+  (- (get-universal-time) 2208988800))
 
-(defun proxy ()
-  (let ((init-state (initial-state)))
+;; a tiny shortcutter for usocket features
+(defmacro socket-accept-wait (&body body)
+  `(socket-accept (wait-for-input ,@body)))
+(defun make-server-socket (config)
+  (socket-listen "127.0.0.1" (value :local-port config)
+		 :element-type '(unsigned-byte 8)))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; MAIN FUNCTIONS
+
+(let (server-socket quit-main)
+  
+  (defun main (&key (config (make-config)))
+    (if server-socket (socket-close server-socket))
+    (setf quit-main nil
+	  server-socket (make-server-socket config))
     (unwind-protect
-	 (loop
-	    for input = nil                    then (get-input (inputs state))
-	    for state = init-state             then (program state input)
-	    for output = (value :output state) do   (send output state)
-	    until (quit-p state))
-      (ignore-errors
-	(close (value :client-stream init-state))
-	(close (value :server-stream init-state))
-	(socket-close (value :client-socket init-state))
-	(socket-close (value :server-socket init-state))))))
+	 (iter (with x = 0) (until quit-main)
+	       (for socket = (socket-accept-wait server-socket :timeout 1))
+	       (when socket (make-thread (lambda () (proxy config socket))
+					 :name (format nil "LispFurcProxy ~D (~D)"
+						       (incf x) (get-unix-time)))))
+      (kill server-socket)))
 
-(defun initial-state ()
-  (let* ((host "lightbringer.furcadia.com")
-	 (port 22)
-	 (local-port 65012)
-	 (timeout (/ (1- (expt 2 32)) 1000))
-	 (furc-path "cd c:\\Program Files (x86)\\Furcadia\\ && Furcadia.exe")
-	 (ext-fmt (make-external-format :latin-1 :eol-style :lf))
-	 (times-until-gc 200)
+  (defun quit-main ()
+    (setf quit-main t)))
 
-	 (client-thread (make-thread (lambda () (uiop:run-program furc-path
-								  :force-shell t
-								  :ignore-error-status t))
-				     :name "Furcadia.exe spawner"))
-	 (client-socket (socket-listen "localhost" local-port :element-type '(unsigned-byte 8)
-				       :reuse-address t))
-	 (client-stream (make-flexi-stream (socket-stream
-					    (socket-accept
-					     (wait-for-input client-socket
-							     :timeout timeout)))
-					   :external-format ext-fmt
-					   :element-type 'octet))
-	 (server-socket (socket-connect host port :element-type '(unsigned-byte 8)))
-	 (server-stream (make-flexi-stream (socket-stream server-socket)
-					   :external-format ext-fmt
-					   :element-type 'octet)))
-    (list (cons :client-thread client-thread)
-	  (cons :client-socket client-socket)
-	  (cons :client-stream client-stream)
-	  (cons :server-socket server-socket)
-	  (cons :server-stream server-stream)
-	  (cons :outputs nil)
-	  (cons :times-until-gc times-until-gc)
-	  (cons :gc-counter times-until-gc))))
+(defun proxy (config accepted-socket)
+  ()
+  (let ((init-state (initial-state config accepted-socket)))
+    (unwind-protect (loop until (quit-p state)
+		       for input = nil then (input state) 
+		       for state = init-state then (program state input)
+		       do (output state))
+      (kill-state init-state))))
+
+(defun kill-state (state)
+  (kill (value :server-reader state))
+  (kill (value :client-reader state)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; STATE FUNCTIONS
+
+(defun initial-state (config client-socket)
+  (let* ((server-socket (socket-connect (value :host config)
+					(value :port config)
+					:element-type '(unsigned-byte 8)))
+	 (client-reader (make-instance 'socket-reader :socket client-socket))
+	 (server-reader (make-instance 'socket-reader :socket server-socket)))
+    (list (cons :client-reader client-reader)
+	  (cons :server-reader server-reader)
+	  (cons :config config)
+	  
+	  (cons :output nil)
+	  (cons :gc-counter (value :times-until-gc config)))))
 
 (defun program (state input)
-  (list (cons :client-thread (value :client-thread state))
-	(cons :client-socket (value :client-socket state))
-	(cons :client-stream (value :client-stream state))
-	(cons :server-socket (value :server-socket state))
-	(cons :server-stream (value :server-stream state))
-	(cons :output (cond ((eq (car input) :client-stream)
-			     (parse-client-speak (cdr input)))
-			    ((eq (car input) :server-stream)
-			     (parse-server-speak (cdr input)))))
-	(cons :times-until-gc (value :times-until-gc state))
-	(cons :gc-counter (cond
-			    ((< (value :gc-counter state) 0)
-			     (gc :full t)
-			     (value :times-until-gc state))
-			    (t
-			     (1- (value :gc-counter state)))))))
+  (list (assoc :client-reader state)
+	(assoc :server-reader state)
+	(assoc :config state)
+	
+	(cons :output (program-output input))
+	(cons :gc-counter (program-gc-counter state))))
 
-(defun inputs (state)
-  (loop
-     (cond
-       ((listen (value :client-stream state))
-	(return (cons :client-stream (value :client-stream state))))
-       ((and (listen (value :server-stream state)))
-	(return (cons :server-stream (value :server-stream state))))
-       (t
-	(sleep 0.1)))))
+(defun program-output (input)
+  (cond ((eq (car input) :client)
+	 (cons :client (parse-client-speak (cdr input))))
+	((eq (car input) :server)
+	 (cons :server (parse-server-speak (cdr input))))))
 
-(defun get-input (input)
-  (let* ((keyword (car input))
-	 (stream (cdr input)))
-    (cons keyword (read-line stream))))
+(defun program-gc-counter (state)
+  (cond
+    ((< (value :gc-counter state) 0)
+     (gc :full t)
+     (config-value :times-until-gc state))
+    (t
+     (1- (value :gc-counter state)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; INPUT FUNCTIONS
+
+(defun input (state)
+  (unless (null state)
+    (loop
+       (cond
+	 ((is-unread (value :server-reader state))
+	  (return (cons :server (get-line (value :server-reader state)))))
+	 ((is-unread (value :client-reader state))
+	  (return (cons :client (get-line (value :client-reader state)))))
+	 (t
+	  (sleep 0.05))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; PARSER FUNCTIONS
 
 (defun parse-client-speak (string)
-  (cons :server-stream string))
+  string)
 
 (defun parse-server-speak (string)
-  (cons :client-stream string))
+  string)
 
-(defun output (state)
-  (value :output state))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; OUTPUT FUNCTIONS
+
+(defun output-type (output)
+  (cond ((eq (car output) :server) "SERVER >>(())")
+	((eq (car output) :client) "(())<< CLIENT")))
 
 (defun output-to-repl (output)
-  (format t "(~A) " (cond ((eq (car output) :client-stream) "SERVER >>(())")
-			  ((eq (car output) :server-stream) "(())<< CLIENT")))
+  (format t "(~A) " (output-type output))
   (format t "~S~%" (cdr output)))
 
-(defun send (output state)
-  (let ((stream (value (car output) state))
-	(string (cdr output)))
-    (unless (null string)
+(defun output (state)
+  (let* ((output (value :output state))
+	 (reader (case (car output)
+		   (:client (value :server-reader state))
+		   (:server (value :client-reader state))))
+	 (string (cdr output)))
+    (unless (or (null string)
+		(string= "" string))
       (output-to-repl (value :output state))
-      (ignore-errors
-	(format stream "~A" string)
-	(terpri stream)
-	(force-output stream)))))
+      (send-line (format-charlist (string-charlist string)) reader))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; QUIT FUNCTIONS
 
 (defun quit-p (state)
-  (let ((output (value :output state)))
-    (or (not (thread-alive-p (value :client-thread state)))
-	(and (eq (car output) :server-stream)
-	     (string= (cdr output) "quit"))
-	(and (eq (car output) :client-stream)
-	     (string= (cdr output) "]]")))))
+  (unless (null state)
+    (or (is-dead (value :client-reader state))
+	(is-dead (value :server-reader state)))))
